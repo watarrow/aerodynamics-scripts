@@ -5,14 +5,18 @@ import glob
 import numpy as np
 import openvsp as vsp # type: ignore
 import shutil
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.subplots import make_subplots
 
 wing_span_res = 10
 wing_chord_res = 25
 velocities = list(range(10, 50, 5)) # m/s
 alphas = list(range(-5, 15)) # degrees AoA
 
+stability_velocity = 30.0 # m/s
 airfoil_file = r"Airfoils\goe322.dat"
-
 x_cg = 0.065
 
 wing_params = {
@@ -41,6 +45,21 @@ vtail_params = {
     "sweep": 15.0
 }
 
+# Stability targets
+stability_targets = {
+    "Cm_alpha":      {"good": -0.4},
+    "CL_alpha":      {"good": 4.0},
+    "Static_Margin": {"good": 0.08,  "limit": 0.15},
+    "CY_beta":       {"good": -0.2},
+    "CY_r":          {"good": 0.1},
+    "Cl_beta":       {"good": -0.05, "limit": -0.20},  # too much -> Dutch roll
+    "Cl_p":          {"good": -0.35},
+    "Cl_r":          {"good": 0.05},
+    "Cm_q":          {"good": -8.0},
+    "Cn_beta":       {"good": 0.06,  "limit": 0.20},   # too much -> spiral divergence
+    "Cn_r":          {"good": -0.1},
+}
+
 def main():
     bref = wing_params["span"]
     cref = wing_params["root_chord"]
@@ -60,12 +79,14 @@ def main():
         print(f"\n=== Running VSP Aero Sweep at {v} m/s ===")
         vsp3_path = shutil.copy(PLANE, "plane.vsp3")
         CL, CD, CDi, Cm = vsp_sweep(vsp3_path, v, Sref, bref, cref)
-        aero_headers = ["Velocity", "Alpha_deg", "CL", "CD", "Cm", "Oswald_efficiency"]
+        e_fit = oswald_from_polar(CL, CD, Sref, bref)
+        aero_headers = ["Velocity", "Alpha_deg", "CL", "CD", "Cm", "Lift", "Drag", "Oswald_efficiency"]
 
         aero_results = []
         for i, alpha in enumerate(alphas):
-            e = compute_oswald(CL[i], CDi[i], Sref, bref)
-            row = [v, alpha, CL[i], CD[i], Cm[i], e]
+            lift = 0.5 * 1.225 * (v ** 2) * Sref * CL[i]
+            drag = 0.5 * 1.225 * (v ** 2) * Sref * CD[i]
+            row = [v, alpha, CL[i], CD[i], Cm[i], lift, drag, e_fit]
             aero_results.append(row)
 
         # Write to CSV
@@ -84,36 +105,39 @@ def main():
             except OSError:
                 pass
 
-    # Stability sweep
-    stab_csv_exists = False
-    
-    for v in velocities:
-        vsp3_path = shutil.copy(PLANE, "plane.vsp3")
-        vsp_stability(vsp3_path, v, Sref, bref, cref)
-        stab_dict = read_stability("plane.stab")
-        
-        stability_filename = "stability.csv"
-        stab_headers = ["Velocity"] + list(stab_dict.keys())
-        stab_columns = [v] + list(stab_dict.values())
-        
-        with open(stability_filename, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not stab_csv_exists:
-                writer.writerow(stab_headers)
-                stab_csv_exists = True
-            writer.writerow(stab_columns)
+    # Stability
+    v = stability_velocity
+    print(f"\n=== Running VSP Stability at {v} m/s (cruise) ===")
+    vsp3_path = shutil.copy(PLANE, "plane.vsp3")
+    vsp_stability(vsp3_path, v, Sref, bref, cref)
+    stab_dict = read_stability("plane.stab")
 
-        for filename in glob.glob("plane*"):
-            try:
-                os.remove(filename)
-            except OSError:
-                pass
+    stability_filename = "stability.csv"
+    stab_headers = ["Velocity"] + list(stab_dict.keys())
+    stab_columns = [v] + list(stab_dict.values())
+
+    with open(stability_filename, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(stab_headers)
+        writer.writerow(stab_columns)
+
+    for filename in glob.glob("plane*"):
+        try:
+            os.remove(filename)
+        except OSError:
+            pass
             
     for filename in glob.glob("Conventional*"):
         try:
             os.remove(filename)
         except OSError:
             pass
+
+    # Launch the dashboard
+    try:
+        plot_dashboard("aero_full.csv", "stability.csv")
+    except Exception as exc:
+        print(f"[dashboard] skipped: {exc}")
 
 def generate_wing_and_tail(plane_name):
     airfoil_fwd  = airfoil_file.replace("\\", "/")
@@ -220,6 +244,7 @@ def vsp_sweep(vsp3_path, velocity, Sref, bref, cref):
 
 def vsp_stability(vsp3_path, v, Sref, bref, cref):
     # Load model
+    vsp.ClearVSPModel()
     vsp.ReadVSPFile(vsp3_path)
     geom_analysis = "VSPAEROComputeGeometry"
     vsp.SetAnalysisInputDefaults(geom_analysis)   
@@ -286,7 +311,7 @@ def read_stability(stab_path):
             if not stripped or stripped.startswith('#'):
                 continue
             tokens = stripped.split()
-            if tokens[0] == 'Coef':
+            if tokens[0] == 'Coef' and col_alpha is None:
                 col_alpha    = tokens.index('Alpha')
                 col_beta     = tokens.index('Beta')
                 col_p        = tokens.index('p')
@@ -313,7 +338,15 @@ def read_stability(stab_path):
                 pass
         return float('nan')
  
+    cm_alpha = get('CMm', col_alpha)           # CMm wrt Alpha
+    cl_alpha = get('CL',  col_alpha)           # CL  wrt Alpha
+    with np.errstate(divide='ignore', invalid='ignore'):
+        sm = float(-cm_alpha / cl_alpha) if (np.isfinite(cl_alpha) and cl_alpha != 0.0) else float('nan')
+
     vsp_dict = {
+        'Cm_alpha': cm_alpha,                  # CMm wrt Alpha (longitudinal static stability)
+        'CL_alpha': cl_alpha,                  # CL  wrt Alpha
+        'Static_Margin': sm,                   # -Cm_alpha / CL_alpha  (>0 = statically stable)
         'CL_de':   get('CL',  col_elevator),   # CL  wrt elevator
         'CY_beta': get('CS',  col_beta),       # CS  wrt Beta
         'CY_p':    get('CS',  col_p),          # CS  wrt p
@@ -365,6 +398,18 @@ def read_lift_distribution(filepath, target_vortex_sheet=1):
                         
     return data_by_aoa
 
+def oswald_from_polar(CL, CD, Sref, bref):
+    AR = bref ** 2 / Sref
+    CL = np.asarray(CL, dtype=float)
+    CD = np.asarray(CD, dtype=float)
+    mask = np.isfinite(CL) & np.isfinite(CD)
+    if mask.sum() < 2:
+        return float("nan")
+    k, _cd0 = np.polyfit(CL[mask] ** 2, CD[mask], 1)  # slope k = 1/(pi*AR*e)
+    if not np.isfinite(k) or k <= 1e-9:  # near-zero slope => degenerate/flat polar
+        return float("nan")
+    return float(1.0 / (np.pi * AR * k))
+
 def compute_oswald(cl, cdi, s, b):
     AR = (b ** 2) / s
     cl_array = np.array(cl, dtype=float)
@@ -375,6 +420,184 @@ def compute_oswald(cl, cdi, s, b):
     if e.ndim == 0:
         return float(e)
     return e
+
+def grade_stability(key, val):
+    t = stability_targets.get(key)
+    if t is None or not np.isfinite(val):
+        return None
+    good, limit = t["good"], t.get("limit")
+    if val * np.sign(good) <= 0:
+        return "fail"
+    if abs(val) < abs(good) or (limit is not None and abs(val) > abs(limit)):
+        return "warn"
+    return "pass"
+
+def target_text(key):
+    t = stability_targets.get(key)
+    if t is None:
+        return "—"
+    good, limit = t["good"], t.get("limit")
+    if limit is not None:
+        lo, hi = sorted((good, limit))
+        return f"{lo:g} to {hi:g}"
+    return f"≥ {good:g}" if good > 0 else f"≤ {good:g}"
+
+def plot_dashboard(sweep_csv="aero_full.csv", stab_csv="stability.csv"):
+    pio.renderers.default = "browser"
+
+    df = pd.read_csv(sweep_csv)
+    df["L_D"] = df["CL"] / df["CD"]
+    stab = pd.read_csv(stab_csv).iloc[0].to_dict()
+
+    velocities_sorted = sorted(df["Velocity"].unique())
+    scale = pio.templates
+    n = max(len(velocities_sorted) - 1, 1)
+    vel_colors = {
+        v: pv_color for v, pv_color in zip(
+            velocities_sorted,
+            [f"hsl({int(210 + 130 * i / n)},70%,60%)" for i in range(len(velocities_sorted))]
+        )
+    }
+
+    specs = [
+        [{"type": "xy"}, {"type": "xy"}, {"type": "xy"}, {"type": "xy"}],   # aero 1-4
+        [{"type": "xy"}, {"type": "xy"}, {"type": "xy"}, {"type": "xy"}],   # aero 5-8
+        [{"type": "xy", "colspan": 4}, None, None, None],                   # stability cards
+        [{"type": "table", "colspan": 4}, None, None, None],                # values table
+    ]
+    titles = [
+        "CL vs \u03b1", "CD vs \u03b1", "Cm vs \u03b1", "Drag polar (CL vs CD)",
+        "L/D vs \u03b1", "Lift vs \u03b1 (N)", "Drag vs \u03b1 (N)", "Oswald e vs velocity",
+        "Cruise stability check (\u03b1 = 0\u00b0)",
+        "Stability derivatives",
+    ]
+    fig = make_subplots(
+        rows=4, cols=4, specs=specs, subplot_titles=titles,
+        row_heights=[0.20, 0.20, 0.24, 0.36],
+        vertical_spacing=0.06, horizontal_spacing=0.06,
+    )
+
+    # Aero graphs
+    def add_curves(xcol, ycol, row, col, show_legend):
+        for v in velocities_sorted:
+            sub = df[df["Velocity"] == v].sort_values("Alpha_deg")
+            fig.add_trace(go.Scatter(
+                x=sub[xcol], y=sub[ycol], mode="lines+markers",
+                name=f"{v:.0f} m/s", legendgroup=f"{v}", showlegend=show_legend,
+                line=dict(color=vel_colors[v], width=2), marker=dict(size=4),
+            ), row=row, col=col)
+
+    add_curves("Alpha_deg", "CL", 1, 1, True)
+    add_curves("Alpha_deg", "CD", 1, 2, False)
+    add_curves("Alpha_deg", "Cm", 1, 3, False)
+    add_curves("CD", "CL", 1, 4, False)          # drag polar
+    add_curves("Alpha_deg", "L_D", 2, 1, False)
+    add_curves("Alpha_deg", "Lift", 2, 2, False)
+    add_curves("Alpha_deg", "Drag", 2, 3, False)
+    e_by_v = df.groupby("Velocity")["Oswald_efficiency"].first().sort_index()
+    fig.add_trace(go.Scatter(
+        x=e_by_v.index, y=e_by_v.values, mode="lines+markers",
+        line=dict(color="#F1C40F", width=2), marker=dict(size=6), showlegend=False,
+        hovertemplate="V=%{x} m/s<br>e=%{y:.3f}<extra></extra>",
+    ), row=2, col=4)
+
+    _amin, _amax = df["Alpha_deg"].min(), df["Alpha_deg"].max()
+    fig.add_trace(go.Scatter(
+        x=[_amin, _amax], y=[0, 0], mode="lines", hoverinfo="skip", showlegend=False,
+        line=dict(color="#888", dash="dot", width=1),
+    ), row=1, col=3)
+
+    # axis labels
+    fig.update_xaxes(title_text="\u03b1 (deg)", row=1, col=1); fig.update_yaxes(title_text="CL", row=1, col=1)
+    fig.update_xaxes(title_text="\u03b1 (deg)", row=1, col=2); fig.update_yaxes(title_text="CD", row=1, col=2)
+    fig.update_xaxes(title_text="\u03b1 (deg)", row=1, col=3); fig.update_yaxes(title_text="Cm", row=1, col=3)
+    fig.update_xaxes(title_text="CD", row=1, col=4);         fig.update_yaxes(title_text="CL", row=1, col=4)
+    fig.update_xaxes(title_text="\u03b1 (deg)", row=2, col=1); fig.update_yaxes(title_text="L/D", row=2, col=1)
+    fig.update_xaxes(title_text="\u03b1 (deg)", row=2, col=2); fig.update_yaxes(title_text="Lift (N)", row=2, col=2)
+    fig.update_xaxes(title_text="\u03b1 (deg)", row=2, col=3); fig.update_yaxes(title_text="Drag (N)", row=2, col=3)
+    fig.update_xaxes(title_text="V (m/s)", row=2, col=4); fig.update_yaxes(title_text="e", row=2, col=4)
+
+    # Stability scorecards
+    card_style = {
+        "pass": ("#2ECC71", "rgba(46,204,113,0.10)"),
+        "warn": ("#F1C40F", "rgba(241,196,15,0.10)"),
+        "fail": ("#E74C3C", "rgba(231,76,60,0.10)"),
+        None:   ("#7F8C8D", "rgba(127,140,141,0.08)"),
+    }
+    cards = [
+        ("Cm_alpha",      "Cm_\u03b1"),
+        ("Static_Margin", "Static Margin"),
+        ("Cn_beta",       "Cn_\u03b2"),
+        ("Cl_beta",       "Cl_\u03b2"),
+        ("Cm_q",          "Cm_q"),
+        ("Cl_p",          "Cl_p"),
+        ("Cn_r",          "Cn_r"),
+        ("CY_beta",       "CY_\u03b2"),
+    ]
+    fig.add_trace(go.Scatter(x=[0, 4], y=[0, 2], mode="markers",
+                             marker=dict(opacity=0), hoverinfo="skip", showlegend=False),
+                  row=3, col=1)
+    fig.update_xaxes(visible=False, range=[0, 4], row=3, col=1)
+    fig.update_yaxes(visible=False, range=[0, 2], row=3, col=1)
+    for idx, (key, label) in enumerate(cards):
+        cx = idx % 4
+        top_band = 2 - (idx // 4)            # top row -> 2, bottom row -> 1
+        x0, x1 = cx + 0.04, cx + 0.96
+        y0, y1 = (top_band - 1) + 0.10, top_band - 0.10
+        xc = (x0 + x1) / 2.0
+        val = float(stab.get(key, float("nan")))
+        edge, fillc = card_style[grade_stability(key, val)]
+        valtxt = f"{val:.3f}" if np.isfinite(val) else "N/A"
+        fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
+                      line=dict(color=edge, width=2), fillcolor=fillc, layer="below",
+                      row=3, col=1)
+        fig.add_annotation(x=xc, y=y1 - 0.16, text=label, showarrow=False,
+                           font=dict(size=15, color="#CCC"), row=3, col=1)
+        fig.add_annotation(x=xc, y=(y0 + y1) / 2.0 - 0.02, text=valtxt, showarrow=False,
+                           font=dict(size=26, color=edge), row=3, col=1)
+        fig.add_annotation(x=xc, y=y0 + 0.14, text=f"target {target_text(key)}", showarrow=False,
+                           font=dict(size=11, color="#888"), row=3, col=1)
+
+    # Values table
+    untargeted_text = {"CY_p": "\u2248 0 (small)", "Cn_p": "\u2248 0 (small)"}
+    order = ["Cm_alpha", "CL_alpha", "Static_Margin", "CY_beta", "CY_p", "CY_r",
+             "Cl_beta", "Cl_p", "Cl_r", "Cm_q", "Cn_beta", "Cn_p", "Cn_r",
+             "CL_de", "Cm_de", "Cl_da", "Cn_da"]
+    NEUTRAL, NA_BG = "#242424", "#333"
+    cell_bg = {"pass": "#183a28", "warn": "#3a3418", "fail": "#3a1e1e", None: NEUTRAL}
+    names, vals, recs, valcol = [], [], [], []
+    for key in order:
+        v = float(stab.get(key, float("nan")))
+        names.append(key)
+        recs.append(untargeted_text.get(key, target_text(key)))
+        if not np.isfinite(v):
+            vals.append("N/A"); valcol.append(NA_BG)
+        else:
+            vals.append(f"{v:.4f}")
+            valcol.append(cell_bg[grade_stability(key, v)])
+    colcol = [NEUTRAL] * len(order)
+    fig.add_trace(go.Table(
+        columnwidth=[1.0, 1.0, 1.4],
+        header=dict(values=["Derivative", "Value", "Recommended"],
+                    fill_color="#444", font=dict(color="white", size=13), align="left"),
+        cells=dict(values=[names, vals, recs],
+                   fill_color=[colcol, valcol, colcol],
+                   font=dict(color="#EEE", size=12), align="left", height=24),
+    ), row=4, col=1)
+
+    v_cruise = stab.get("Velocity", "?")
+    fig.update_layout(
+        template="plotly_dark",
+        title=dict(text=f"Conventional UAV \u2014 Aero Sweep & Cruise Stability "
+                        f"(stability @ {v_cruise} m/s, \u03b1 = 0\u00b0)",
+                   x=0.5, font=dict(size=22)),
+        height=1900, width=1500,
+        paper_bgcolor="#111", plot_bgcolor="#1b1b1b",
+        legend=dict(title="Velocity", orientation="v", x=1.01, y=1.0),
+        margin=dict(l=60, r=60, t=90, b=40),
+    )
+    fig.show()
+    return fig
 
 if __name__ == "__main__":
     main()
